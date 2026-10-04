@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Frame auf 16×9 reduzieren</title>
+<style>
+body { font-family: sans-serif; background:#111; color:#fff; padding:20px; max-width:640px; margin:0 auto; }
+h1 { font-size:20px; }
+.row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:12px 0; }
+input[type="text"] { padding:9px; font-size:15px; width:130px; background:#222; color:#fff; border:1px solid #444; border-radius:4px; }
+select { padding:9px; font-size:15px; background:#222; color:#fff; border:1px solid #444; border-radius:4px; }
+button { padding:10px 16px; font-size:15px; cursor:pointer; }
+button:disabled { opacity:0.4; cursor:default; }
+#status { margin:14px 0; color:#aaa; min-height:1.2em; }
+#preview { width:100%; max-width:640px; aspect-ratio:16/9; image-rendering:pixelated; background:#000; border:1px solid #333; display:block; }
+.hint { color:#888; font-size:13px; }
+video { display:none; }
+</style>
+</head>
+<body>
+
+<h1>Frame auf 16×9 Pixel reduzieren</h1>
+
+<div class="row">
+  <input type="file" id="fileInput" accept="video/*">
+</div>
+
+<div class="row">
+  <label for="timeInput">Zeitpunkt:</label>
+  <input type="text" id="timeInput" value="0" placeholder="z. B. 12,5 oder 1:23,4" disabled>
+  <button id="extractBtn" disabled>Frame erzeugen</button>
+</div>
+<div class="hint">Eingabe in Sekunden (12,5) oder als Minuten:Sekunden (1:23,4).</div>
+
+<div id="status"></div>
+
+<canvas id="preview" width="16" height="9"></canvas>
+
+<div class="row">
+  <label for="scaleSelect">Download-Größe:</label>
+  <select id="scaleSelect">
+    <option value="1">16 × 9 (Original)</option>
+    <option value="10">160 × 90 (10×, Pixel scharf)</option>
+    <option value="40">640 × 360 (40×, Pixel scharf)</option>
+  </select>
+  <button id="downloadBtn" disabled>Als JPEG herunterladen</button>
+</div>
+
+<video id="video" playsinline preload="metadata"></video>
+
+<script>
+"use strict";
+
+const fileInput = document.getElementById("fileInput");
+const video = document.getElementById("video");
+const timeInput = document.getElementById("timeInput");
+const extractBtn = document.getElementById("extractBtn");
+const downloadBtn = document.getElementById("downloadBtn");
+const scaleSelect = document.getElementById("scaleSelect");
+const statusEl = document.getElementById("status");
+const previewCanvas = document.getElementById("preview");
+const previewCtx = previewCanvas.getContext("2d");
+
+// Identisch zur Analyse-Datei
+const ANALYSIS_WIDTH = 160;
+const ANALYSIS_HEIGHT = 90;
+const CONTRAST_GRID_COLS = 16;
+const CONTRAST_GRID_ROWS = 9;
+const NUM_BLOCKS = CONTRAST_GRID_COLS * CONTRAST_GRID_ROWS;
+const SEEK_TIMEOUT_MS = 3000;
+
+const analysisCanvas = document.createElement("canvas");
+analysisCanvas.width = ANALYSIS_WIDTH;
+analysisCanvas.height = ANALYSIS_HEIGHT;
+const analysisCtx = analysisCanvas.getContext("2d", { willReadFrequently: true });
+
+let videoURL = null;
+let currentTimeLabel = "0";
+let busy = false;
+
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  if (file.type && !file.type.startsWith("video/")) {
+    statusEl.textContent = "Bitte eine Videodatei auswählen.";
+    fileInput.value = "";
+    return;
+  }
+
+  if (videoURL) URL.revokeObjectURL(videoURL);
+  videoURL = URL.createObjectURL(file);
+  video.src = videoURL;
+
+  extractBtn.disabled = true;
+  timeInput.disabled = true;
+  downloadBtn.disabled = true;
+  statusEl.textContent = "Lade Video …";
+
+  video.addEventListener("loadedmetadata", () => {
+    extractBtn.disabled = false;
+    timeInput.disabled = false;
+    statusEl.textContent = `Video geladen (${formatDecimal(video.duration, 2)} s). Zeitpunkt eingeben.`;
+  }, { once: true });
+
+  video.addEventListener("error", () => {
+    statusEl.textContent = "Video konnte nicht gelesen werden.";
+  }, { once: true });
+});
+
+extractBtn.addEventListener("click", runExtract);
+timeInput.addEventListener("keydown", e => { if (e.key === "Enter") runExtract(); });
+
+downloadBtn.addEventListener("click", () => {
+  const scale = parseInt(scaleSelect.value, 10) || 1;
+  const out = document.createElement("canvas");
+  out.width = CONTRAST_GRID_COLS * scale;
+  out.height = CONTRAST_GRID_ROWS * scale;
+  const ctx = out.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(previewCanvas, 0, 0, out.width, out.height);
+
+  out.toBlob(blob => {
+    if (!blob) { statusEl.textContent = "JPEG konnte nicht erzeugt werden."; return; }
+    const a = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    a.href = url;
+    a.download = `frame_${currentTimeLabel}s_${out.width}x${out.height}.jpg`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, "image/jpeg", 1.0);
+});
+
+async function runExtract() {
+  if (busy || extractBtn.disabled) return;
+
+  const requested = parseTime(timeInput.value);
+  if (requested === null) {
+    statusEl.textContent = "Ungültiger Zeitpunkt.";
+    return;
+  }
+
+  busy = true;
+  extractBtn.disabled = true;
+  downloadBtn.disabled = true;
+
+  try {
+    const duration = video.duration;
+    let target = requested;
+    let note = "";
+    if (target >= duration) {
+      target = Math.max(0, duration - 0.05);
+      note = " (Zeitpunkt lag hinter dem Videoende, letzter Frame verwendet)";
+    }
+
+    await seekVideo(target);
+    const time = video.currentTime;
+
+    drawVideoFrameForAnalysis();
+    const imageData = analysisCtx.getImageData(0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
+    const small = reduceTo16x9(imageData.data);
+
+    previewCtx.putImageData(small, 0, 0);
+
+    currentTimeLabel = time.toFixed(2).replace(".", "-");
+    statusEl.textContent = `Frame bei ${formatDecimal(time, 2)} s${note}`;
+    downloadBtn.disabled = false;
+  } catch (error) {
+    console.error(error);
+    statusEl.textContent = "Fehler: " + error.message;
+  } finally {
+    busy = false;
+    extractBtn.disabled = false;
+  }
+}
+
+// Exakt dieselbe Zeichnung wie in der Analyse-Datei (160x90, Letterbox schwarz)
+function drawVideoFrameForAnalysis() {
+  const videoWidth = video.videoWidth || ANALYSIS_WIDTH;
+  const videoHeight = video.videoHeight || ANALYSIS_HEIGHT;
+  const canvasAspect = ANALYSIS_WIDTH / ANALYSIS_HEIGHT;
+  const videoAspect = videoWidth / videoHeight;
+
+  let drawWidth, drawHeight;
+  if (videoAspect > canvasAspect) {
+    drawWidth = ANALYSIS_WIDTH;
+    drawHeight = ANALYSIS_WIDTH / videoAspect;
+  } else {
+    drawHeight = ANALYSIS_HEIGHT;
+    drawWidth = ANALYSIS_HEIGHT * videoAspect;
+  }
+
+  const offsetX = (ANALYSIS_WIDTH - drawWidth) / 2;
+  const offsetY = (ANALYSIS_HEIGHT - drawHeight) / 2;
+
+  analysisCtx.fillStyle = "#000";
+  analysisCtx.fillRect(0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
+  analysisCtx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
+}
+
+// Blockmittel (10x10 Pixel -> 1 Pixel), identische Blocklogik wie in analyzeFrame
+function reduceTo16x9(data) {
+  const blockWidth = ANALYSIS_WIDTH / CONTRAST_GRID_COLS;
+  const blockHeight = ANALYSIS_HEIGHT / CONTRAST_GRID_ROWS;
+
+  const sumR = new Float64Array(NUM_BLOCKS);
+  const sumG = new Float64Array(NUM_BLOCKS);
+  const sumB = new Float64Array(NUM_BLOCKS);
+  const cnt = new Int32Array(NUM_BLOCKS);
+
+  for (let i = 0; i < data.length; i += 4) {
+    const pixelIndex = i / 4;
+    const x = pixelIndex % ANALYSIS_WIDTH;
+    const y = Math.floor(pixelIndex / ANALYSIS_WIDTH);
+    const blockCol = Math.min(CONTRAST_GRID_COLS - 1, Math.floor(x / blockWidth));
+    const blockRow = Math.min(CONTRAST_GRID_ROWS - 1, Math.floor(y / blockHeight));
+    const idx = blockRow * CONTRAST_GRID_COLS + blockCol;
+
+    sumR[idx] += data[i];
+    sumG[idx] += data[i + 1];
+    sumB[idx] += data[i + 2];
+    cnt[idx]++;
+  }
+
+  const out = new ImageData(CONTRAST_GRID_COLS, CONTRAST_GRID_ROWS);
+  for (let b = 0; b < NUM_BLOCKS; b++) {
+    const n = cnt[b] || 1;
+    out.data[b * 4]     = Math.round(sumR[b] / n);
+    out.data[b * 4 + 1] = Math.round(sumG[b] / n);
+    out.data[b * 4 + 2] = Math.round(sumB[b] / n);
+    out.data[b * 4 + 3] = 255;
+  }
+  return out;
+}
+
+function seekVideo(time, timeoutMs = SEEK_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    if (Math.abs(video.currentTime - time) < 1e-6 && video.readyState >= 2) {
+      resolve();
+      return;
+    }
+
+    let settled = false;
+
+    const onSeeked = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+
+    const onError = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error("Video konnte nicht gelesen werden."));
+    };
+
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error("Zeitüberschreitung beim Springen im Video."));
+    }, timeoutMs);
+
+    function cleanup() {
+      clearTimeout(timeoutId);
+      video.removeEventListener("seeked", onSeeked);
+      video.removeEventListener("error", onError);
+    }
+
+    video.addEventListener("seeked", onSeeked, { once: true });
+    video.addEventListener("error", onError, { once: true });
+    video.currentTime = time;
+  });
+}
+
+function parseTime(str) {
+  const s = String(str).trim().replace(",", ".");
+  if (!s) return null;
+  const parts = s.split(":");
+  if (parts.length > 3) return null;
+  let total = 0;
+  for (const p of parts) {
+    if (!/^\d+(\.\d+)?$/.test(p)) return null;
+    total = total * 60 + parseFloat(p);
+  }
+  return isFinite(total) ? total : null;
+}
+
+function formatDecimal(value, digits = 1) {
+  if (typeof value !== "number" || !isFinite(value)) return "–";
+  return value.toFixed(digits).replace(".", ",");
+}
+</script>
+
+</body>
+</html>
