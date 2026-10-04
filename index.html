@@ -43,7 +43,7 @@ video { display:none; }
     <option value="1">16 × 9 (Original)</option>
     <option value="10">160 × 90 (10×, Pixel scharf)</option>
     <option value="40">640 × 360 (40×, Pixel scharf)</option>
-    <option value="40">2400 × 1350 (150×, Pixel scharf)</option>
+    <option value="custom">2350 × 1322 (Pixel scharf)</option>
   </select>
   <button id="downloadBtn" disabled>Als JPEG herunterladen</button>
 </div>
@@ -114,10 +114,15 @@ extractBtn.addEventListener("click", runExtract);
 timeInput.addEventListener("keydown", e => { if (e.key === "Enter") runExtract(); });
 
 downloadBtn.addEventListener("click", () => {
-  const scale = parseInt(scaleSelect.value, 10) || 1;
   const out = document.createElement("canvas");
-  out.width = CONTRAST_GRID_COLS * scale;
-  out.height = CONTRAST_GRID_ROWS * scale;
+  if (scaleSelect.value === "custom") {
+    out.width = 2350;
+    out.height = 1322;
+  } else {
+    const scale = parseInt(scaleSelect.value, 10) || 1;
+    out.width = CONTRAST_GRID_COLS * scale;
+    out.height = CONTRAST_GRID_ROWS * scale;
+  }
   const ctx = out.getContext("2d");
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(previewCanvas, 0, 0, out.width, out.height);
